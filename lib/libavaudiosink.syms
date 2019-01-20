@@ -1,0 +1,12 @@
+avaudiosink_open
+avaudiosink_close
+avaudiosink_write
+avaudiosink_play
+avaudiosink_flush
+avaudiosink_ready
+avaudiosink_timeseconds
+avaudiosink_delayseconds
+avaudiosink_delay2seconds
+avaudiosink_errorseconds
+avaudiosink_mindelayseconds
+avaudiosink_maxdelayseconds
