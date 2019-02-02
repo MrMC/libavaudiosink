@@ -287,7 +287,7 @@
     _avplayer = [[AVPlayer alloc] init];
     // this little gem primes avplayer so next
     // load with a playerItem is fast... go figure.
-    NSBundle *bundle = [NSBundle bundleForClass:[self class]];
+    NSBundle *bundle = [NSBundle mainBundle];
     if (bundle)
     {
       NSString *filepath = [bundle pathForResource:@"point1sec" ofType:@"mp3"];
