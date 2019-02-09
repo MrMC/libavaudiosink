@@ -5,7 +5,9 @@
 
 typedef struct OpaqueAVAudioSinkSession AVAudioSinkSessionRef;
 
+#ifdef __cplusplus
 extern "C" {
+#endif /* __cplusplus */
   AVAudioSinkSessionRef* avaudiosink_open(const int framebytes);
   void avaudiosink_close(AVAudioSinkSessionRef *avref);
   int avaudiosink_write(AVAudioSinkSessionRef* avref, const uint8_t *buf, int len);
@@ -18,6 +20,8 @@ extern "C" {
   double avaudiosink_errorseconds(AVAudioSinkSessionRef* avref);
   double avaudiosink_mindelayseconds(AVAudioSinkSessionRef* avref);
   double avaudiosink_maxdelayseconds(AVAudioSinkSessionRef* avref);
+#ifdef __cplusplus
 }
+#endif /* __cplusplus */
 
 #endif
