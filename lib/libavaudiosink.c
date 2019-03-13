@@ -1,6 +1,8 @@
-#include <stdlib.h>
-
-#include "AERingBuffer.h"
+#import <atomic>
+#import <string>
+#import <stdlib.h>
+#import <unistd.h>
+#import <sys/stat.h>
 
 #import <AVFoundation/AVFoundation.h>
 #import <AVFoundation/AVAudioSession.h>
@@ -9,65 +11,83 @@
 //-----------------------------------------------------------------------------------
 //-----------------------------------------------------------------------------------
 @interface AudioResourceLoader : NSObject <AVAssetResourceLoaderDelegate>
-@property (nonatomic) bool abortflag;
-@property (nonatomic) unsigned int frameBytes;
-@property (nonatomic) char *readbuffer;
-@property (nonatomic) size_t readbufferSize;
-@property (nonatomic) AERingBuffer *avbuffer;
-@property (nonatomic) int errorCount;
-@property (nonatomic) unsigned int transferCount;
-@property (nonatomic) NSData *dataAtOffsetZero;
+@property (atomic) float currentTime;
+@property (atomic) float bufferedTime;
+@property (atomic) float minBufferedTime;
 - (id)initWithFrameBytes:(unsigned int)frameBytes;
 - (void)abort;
-- (int) write:(uint8_t*)data size:(unsigned int)size;
-- (double)errorSeconds;
-- (double)bufferSeconds;
-- (double)transferSeconds;
 @end
 
 @implementation AudioResourceLoader
+  std::atomic<bool>  mAbortflag;
+  char *mReadbuffer;
+  size_t mReadbufferSize;
+  int mFileReader;
+  float mFrameBytes;
+  float mFrameDuration;
+  int64_t mBufferedBytes;
+
 - (id)initWithFrameBytes:(unsigned int)frameBytes
 {
   self = [super init];
   if (self)
   {
-    _abortflag = false;
-    _frameBytes = frameBytes;
+    _currentTime = 0.0f;
+    _bufferedTime = 0.0f;
+    _minBufferedTime = 2.5f;
+    mAbortflag = false;
+    mFrameBytes = frameBytes;
+    mFrameDuration = (256.0 * 6) / 48000.0; // 0.032 seconds
+    mBufferedBytes = 0;
     // readbufferSize must be greater that 65536.
-    _readbufferSize = _frameBytes * 48;
-    _avbuffer = new AERingBuffer(_readbufferSize);
-    // make readbuffer one frame larger
-    _readbufferSize += _frameBytes;
-    _readbuffer = new char[_readbufferSize];
-    _errorCount = 0;
-    _transferCount = 0;
+    mReadbufferSize = mFrameBytes * 40;
+    if (mReadbufferSize < 65536)
+      mReadbufferSize = 65536;
+    mReadbuffer = new char[mReadbufferSize];
+    std::string tmpBufferFile = [NSTemporaryDirectory() UTF8String];
+    tmpBufferFile += "avaudio.ec3";
+    mFileReader = open(tmpBufferFile.c_str(), O_RDONLY, 00666);
+
   }
   return self;
 }
 
 - (void)dealloc
 {
-  delete _avbuffer, _avbuffer = nullptr;
-  delete _readbuffer, _avbuffer = nullptr;
+  close(mFileReader);
+}
+
+- (void)abort
+{
+  mAbortflag = true;
+}
+
+- (bool)checkFileBufferLength:(size_t)offset length:(size_t)length
+{
+  struct stat statbuf;
+  fstat(mFileReader, &statbuf);
+  off_t filelength = statbuf.st_size;
+  //NSLog(@"resourceLoader: file size %lld", filelength);
+  if (filelength >= offset + length)
+    return true;
+
+  return false;
 }
 
 - (NSError *)loaderCancelledError
 {
   NSError *error = [[NSError alloc] initWithDomain:@"AudioResourceLoaderErrorDomain"
     code:-1 userInfo:@{NSLocalizedDescriptionKey:@"avloader cancelled"}];
-  _abortflag = true;
+  mAbortflag = true;
   return error;
 }
 
-#define logDataRequestError 0
-#define logDataRequestEndOf 0
-#define logDataRequestBgnEnd 0
-#define logDataRequestSending 0
+#define logDataRequest 0
 - (BOOL)resourceLoader:(AVAssetResourceLoader *)resourceLoader shouldWaitForLoadingOfRequestedResource:(AVAssetResourceLoadingRequest *)loadingRequest
 {
   AVAssetResourceLoadingContentInformationRequest* contentRequest = loadingRequest.contentInformationRequest;
 
-  if (_abortflag)
+  if (mAbortflag)
   {
     [loadingRequest finishLoadingWithError:[self loaderCancelledError]];
     return YES;
@@ -77,7 +97,7 @@
   {
     // only handles eac3
     contentRequest.contentType = @"public.enhanced-ac3-audio";
-    // (2147483647) or 383479.222678571428571 seconds at 0.032 secs pre 1792 byte frame
+    // (2147483647) or 383479.222678571428571 seconds at 0.032 secs per 1792 byte frame
     // or 10.652200629960317 hours.
     contentRequest.contentLength = INT_MAX;
     // must be 'NO' to get player to start playing immediately
@@ -88,117 +108,80 @@
   AVAssetResourceLoadingDataRequest* dataRequest = loadingRequest.dataRequest;
   if (dataRequest)
   {
-    //There where always 3 initial requests
-    // 1) one for the first two bytes of the file
-    // 2) one from the beginning of the file
-    // 3) one from the end of the file
-    //NSLog(@"resourceLoader dataRequest %@", dataRequest);
-#if logDataRequestBgnEnd
-    NSLog(@"avloader dataRequest bgn");
-#endif
-    NSInteger reqLen = dataRequest.requestedLength;
-    if (reqLen == 2)
+    // avplayer does a few probing requests.
+    bool probing = false;
+    if (dataRequest.requestedLength == 65536)
     {
-      // 1) from above.
-      // avplayer always 1st read two bytes to check for a content tag.
+      if (dataRequest.requestedOffset > 0)
+        probing = true;
+    }
+
+    //NSLog(@"probing %d, resourceLoader dataRequest %@", probing, dataRequest);
+
+    // overflow throttle, keep about 3-4 seconds buffered in avplayer
+    _bufferedTime = mFrameDuration * ((float)mBufferedBytes / mFrameBytes);
+    while (!mAbortflag && _bufferedTime - _currentTime > _minBufferedTime)
+    {
+      usleep(32 * 1000);
+    }
+
+    if (dataRequest.requestedLength == 2)
+    {
+      // avplayer always 1st reads two bytes to check for a content tag.
       // ac3/eac3 has two byte tag of 0x0b77, \v is vertical tab == 0x0b
       [dataRequest respondWithData:[NSData dataWithBytes:"\vw" length:2]];
+#if logDataRequest
+      NSLog(@"resourceLoader: probing 1, sending 2 bytes");
+#endif
       [loadingRequest finishLoading];
-      //NSLog(@"avloader check content tag, %u in buffer", _avbuffer->GetReadSize());
     }
     else
     {
-      size_t requestedBytes = _frameBytes * 2;
-      if (dataRequest.requestedOffset == 0)
+      size_t offset = dataRequest.requestedOffset;
+      size_t length = mReadbufferSize;
+      if (dataRequest.requestedLength == 65536)
       {
-        // 2) above. make sure avplayer has enough frame blocks at startup
-        requestedBytes = _frameBytes * 36;
+        // 1st 64k read attempt or probes
+        offset = 0;
+        length = 65536;
       }
 
-      if (dataRequest.requestsAllDataToEndOfResource == NO && dataRequest.requestedOffset != 0)
+      // Pull audio from buffer
+      while (!mAbortflag && ![self checkFileBufferLength:offset length:length])
       {
-        // 3) from above.
-        // we have already hit 2) and saved it.
-        // just shove it back to make avplayer happy.
-        [dataRequest respondWithData:_dataAtOffsetZero];
-#if logDataRequestEndOf
-        NSLog(@"avloader check endof, %u in buffer", _avbuffer->GetReadSize());
-#endif
-        //NSLog(@"avloader requestedLength:%zu, requestedOffset:%lld, currentOffset:%lld, bufferbytes:%u",
-        //  dataRequest.requestedLength, dataRequest.requestedOffset, dataRequest.currentOffset, _avbuffer->GetReadSize());
-        [loadingRequest finishLoading];
-#if logDataRequestBgnEnd
-        NSLog(@"avloader dataRequest end");
-#endif
-        return YES;
+        usleep(32 * 1000);
       }
-
-      // 2) from above and any other type of transfer
-      while (_avbuffer->GetReadSize() < requestedBytes)
-      {
-        if (_abortflag)
-        {
-          [loadingRequest finishLoadingWithError:[self loaderCancelledError]];
-#if logDataRequestBgnEnd
-          NSLog(@"avloader dataRequest end");
-#endif
-          return YES;
-        }
-        usleep(10 * 1000);
-      }
-      if (dataRequest.requestsAllDataToEndOfResource == YES && dataRequest.requestedLength > (long)requestedBytes)
-      {
-        // calc how many complete frames are present
-        size_t maxFrameBytes = _frameBytes * (_avbuffer->GetReadSize() / _frameBytes);
-        // limit to size of _readbuffer
-        if (maxFrameBytes > (_readbufferSize))
-          maxFrameBytes = _frameBytes * ((_readbufferSize) / _frameBytes);
-        //NSLog(@"avloader maxframebytes %lu", maxFrameBytes);
-        requestedBytes = maxFrameBytes;
-      }
-
-      _avbuffer->Read((unsigned char*)_readbuffer, requestedBytes);
+      lseek(mFileReader, offset, SEEK_SET);
+      size_t availableBytes = read(mFileReader, mReadbuffer, length);
 
       // check if we have enough data
-      if (requestedBytes)
+      if (availableBytes > 0)
       {
-        NSData *data = [NSData dataWithBytes:_readbuffer length:requestedBytes];
-        if (dataRequest.requestsAllDataToEndOfResource == NO && dataRequest.requestedOffset == 0)
-          _dataAtOffsetZero = [NSData dataWithBytes:_readbuffer length:requestedBytes];
-        [dataRequest respondWithData:data];
-
-#if logDataRequestSending
-        // log the transfer
-        size_t bufferbytes = _avbuffer->GetReadSize();
-        if (bufferbytes > 0)
-          NSLog(@"avloader sending %lu bytes, %zu in buffer",
-            (unsigned long)[data length], bufferbytes);
-        else
-          NSLog(@"avloader sending %lu bytes", (unsigned long)[data length]);
-#endif
-        _transferCount += requestedBytes;
-        if (_transferCount != dataRequest.currentOffset)
+        size_t requestedLength = (size_t)dataRequest.requestedLength;
+        size_t bytesToCopy = requestedLength > availableBytes ? availableBytes : requestedLength;
+        if (bytesToCopy > 0)
         {
-          _errorCount = _transferCount - dataRequest.currentOffset;
-#if logDataRequestError
-          CLog::Log(LOGWARNING, "avloader requestedLength:%zu, requestedOffset:%lld, currentOffset:%lld, _transferCount:%u, bufferbytes:%u",
-            dataRequest.requestedLength, dataRequest.requestedOffset, dataRequest.currentOffset, _transferCount, _avbuffer->GetReadSize());
+            NSData *data = [NSData dataWithBytes:mReadbuffer length:bytesToCopy];
+            [dataRequest respondWithData:data];
+#if logDataRequest
+            NSLog(@"resourceLoader: probing %d, sending %lu bytes, ending offset %llu",
+              probing, (unsigned long)[data length], dataRequest.currentOffset);
 #endif
+            if (!probing)
+              mBufferedBytes = dataRequest.currentOffset;
         }
         [loadingRequest finishLoading];
       }
       else
       {
-#if logDataRequestError
-        NSLog(@"avloader loaderCancelledError");
+        // maybe return an empty buffer so silence is played until we have data
+#if logDataRequest
+        NSLog(@"resourceLoader: loading finished");
 #endif
         [loadingRequest finishLoadingWithError:[self loaderCancelledError]];
       }
     }
   }
-#if logDataRequestBgnEnd
-  NSLog(@"avloader dataRequest end");
-#endif
 
   return YES;
 }
@@ -206,43 +189,9 @@
 - (void)resourceLoader:(AVAssetResourceLoader *)resourceLoader
   didCancelLoadingRequest:(AVAssetResourceLoadingRequest *)loadingRequest
 {
-  _abortflag = true;
-#if logDataRequestError
-  NSLog(@"avloader didCancelLoadingRequest");
-#endif
+  mAbortflag = true;
 }
 
-- (void)abort
-{
-  _abortflag = true;
-}
-
-- (int)write:(uint8_t*)data size:(unsigned int)size
-{
-  if (data && size > 0)
-  {
-    int ok = AE_RING_BUFFER_OK;
-    if (_avbuffer->Write(data, size) == ok)
-      return size;
-  }
-
-  return 0;
-}
-
-- (double)errorSeconds
-{
-  return ((double)_errorCount / _frameBytes) * 0.032;
-}
-
-- (double)bufferSeconds
-{
-  return ((double)_avbuffer->GetReadSize() / _frameBytes) * 0.032;
-}
-
-- (double)transferSeconds
-{
-  return ((double)_transferCount / _frameBytes) * 0.032;
-}
 @end
 
 #pragma mark - AVPlayerSink
@@ -256,10 +205,8 @@
 - (void)start;
 - (bool)loaded;
 - (void)flush;
-- (double)errorSeconds;
-- (double)clockSeconds;
-- (double)bufferSeconds;
-- (double)sinkBufferSeconds;
+- (double)currentTime;
+- (double)bufferedTime;
 @end
 
 @interface AVPlayerSink ()
@@ -273,6 +220,7 @@
 @end
 
 @implementation AVPlayerSink
+  int mFileWriter;
 //-----------------------------------------------------------------------------------
 //-----------------------------------------------------------------------------------
 - (id)initWithFrameSize:(unsigned int)frameSize;
@@ -283,22 +231,8 @@
     _loadedFlag = false;
     _frameSize = frameSize;
     _serialQueue = dispatch_queue_create("com.mrmc.loaderqueue", DISPATCH_QUEUE_SERIAL);
-
+    mFileWriter = 0;
     _avplayer = [[AVPlayer alloc] init];
-    // this little gem primes avplayer so next
-    // load with a playerItem is fast... go figure.
-    NSBundle *bundle = [NSBundle mainBundle];
-    if (bundle)
-    {
-      NSString *filepath = [bundle pathForResource:@"point1sec" ofType:@"mp3"];
-      if (filepath)
-      {
-        //NSLog(@"avloader playing silence =  %@", filepath);
-        AVPlayerItem *playerItem = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:filepath]];
-        [_avplayer replaceCurrentItemWithPlayerItem:playerItem];
-        [_avplayer play];
-      }
-    }
   }
   NSString *name = [NSProcessInfo processInfo].processName;
   if (![name hasPrefix:[NSString stringWithUTF8String:"MrMC"]])
@@ -313,6 +247,8 @@
 //-----------------------------------------------------------------------------------
 - (void)close
 {
+  close(mFileWriter), mFileWriter = 0;
+
   [_avplayer.currentItem.asset cancelLoading];
   [_avplayer replaceCurrentItemWithPlayerItem:nil];
   _avplayer = nullptr;
@@ -359,8 +295,11 @@
 //-----------------------------------------------------------------------------------
 - (int)addPackets:(uint8_t*)data size:(unsigned int)size
 {
+  CMTime cmSeconds = [_playerItem currentTime];
+  _avLoader.currentTime = CMTimeGetSeconds(cmSeconds);
+
   if (data && size > 0)
-    return [_avLoader write:data size:size];
+    return write(mFileWriter, data, size);
 
   return size;
 }
@@ -387,6 +326,12 @@
   // run on our own serial queue, keeps main thread from stalling us
   // and lets us do long sleeps waiting for data without stalling main thread.
   dispatch_sync(_serialQueue, ^{
+    std::string tmpBufferFile = [NSTemporaryDirectory() UTF8String];
+    tmpBufferFile += "avaudio.ec3";
+    unlink(tmpBufferFile.c_str());
+    mFileWriter = open(tmpBufferFile.c_str(), O_CREAT | O_WRONLY | O_APPEND | O_SYNC, 00666);
+    fsync(mFileWriter);
+
     NSString *extension = @"ec3";
     // needs leading dir ('fake') or pathExtension in resourceLoader will fail
     NSMutableString *url = [NSMutableString stringWithString:@"mrmc_streaming://fake/dummy."];
@@ -415,6 +360,8 @@
 //-----------------------------------------------------------------------------------
 - (void)flush
 {
+  close(mFileWriter), mFileWriter = 0;
+
   [_avplayer replaceCurrentItemWithPlayerItem:nil];
   [_playerItem removeObserver:self forKeyPath:@"status"];
   [_playerItem.asset cancelLoading];
@@ -425,21 +372,11 @@
 }
 
 //-----------------------------------------------------------------------------------
-- (double)errorSeconds
+- (double)currentTime
 {
-  return [_avLoader errorSeconds];
-}
-
-//-----------------------------------------------------------------------------------
-- (double)clockSeconds
-{
-  CMTime currentTime = [_playerItem currentTime];
-  double sink_s = CMTimeGetSeconds(currentTime);
-  // errorSeconds is a time chunk that was lost
-  // during transfer to avplayer. Either avplayer ate
-  // it or there was a buffer overlow somewhere...
-  double errorSeconds = [_avLoader errorSeconds];
-  sink_s += errorSeconds;
+  CMTime cmSeconds = [_playerItem currentTime];
+  double sink_s = CMTimeGetSeconds(cmSeconds);
+  _avLoader.currentTime = sink_s;
   if (sink_s > 0.0)
     return sink_s;
   else
@@ -447,38 +384,17 @@
 }
 
 //-----------------------------------------------------------------------------------
-- (double)bufferSeconds
+- (double)bufferedTime
 {
-  double avbufferSeconds = [_avLoader bufferSeconds];
-  double transferSeconds = [_avLoader transferSeconds];
-  double playerSeconds = [self clockSeconds];
-  double seconds = (transferSeconds - playerSeconds) + avbufferSeconds;
+  CMTime cmSeconds = [_playerItem currentTime];
+  _avLoader.currentTime = CMTimeGetSeconds(cmSeconds);
+  double seconds = _avLoader.bufferedTime - _avLoader.currentTime;
   if (seconds < 0.0)
     seconds = 0.0;
 
   return seconds;
 }
 
-//-----------------------------------------------------------------------------------
-- (double)sinkBufferSeconds
-{
-  double buffered_s = 0.0;
-  if (_playerItem)
-  {
-    NSArray *timeRanges = [_playerItem loadedTimeRanges];
-    if (timeRanges && [timeRanges count])
-    {
-      CMTimeRange timerange = [[timeRanges objectAtIndex:0]CMTimeRangeValue];
-      //NSLog(@"avloader timerange.start %f", CMTimeGetSeconds(timerange.start));
-      double duration = CMTimeGetSeconds(timerange.duration);
-      //NSLog(@"avloader timerange.duration %f", duration);
-      buffered_s = duration - [self clockSeconds];
-      if (buffered_s < 0.0)
-        buffered_s = 0.0;
-    }
-  }
-  return buffered_s;
-}
 @end
 
 //-----------------------------------------------------------------------------------
@@ -549,7 +465,7 @@ extern "C" int avaudiosink_ready(AVAudioSinkSessionRef* avref)
 extern "C" double avaudiosink_timeseconds(AVAudioSinkSessionRef* avref)
 {
   if (avref && avref->avsink)
-    return [avref->avsink clockSeconds];
+    return [avref->avsink currentTime];
   return 0.0;
 };
 
@@ -557,7 +473,7 @@ extern "C" double avaudiosink_timeseconds(AVAudioSinkSessionRef* avref)
 extern "C" double avaudiosink_delayseconds(AVAudioSinkSessionRef* avref)
 {
   if (avref && avref->avsink)
-    return [avref->avsink bufferSeconds];
+    return [avref->avsink bufferedTime];
   return 0.0;
 };
 
@@ -565,15 +481,13 @@ extern "C" double avaudiosink_delayseconds(AVAudioSinkSessionRef* avref)
 extern "C" double avaudiosink_delay2seconds(AVAudioSinkSessionRef* avref)
 {
   if (avref && avref->avsink)
-    return [avref->avsink sinkBufferSeconds];
+    return [avref->avsink bufferedTime];
   return 0.0;
 };
 
 // sink error seconds
 extern "C" double avaudiosink_errorseconds(AVAudioSinkSessionRef* avref)
 {
-  if (avref && avref->avsink)
-    return [avref->avsink errorSeconds];
   return 0.0;
 };
 
@@ -584,6 +498,6 @@ extern "C" double avaudiosink_mindelayseconds(AVAudioSinkSessionRef* avref)
 
 extern "C" double avaudiosink_maxdelayseconds(AVAudioSinkSessionRef* avref)
 {
-  return 3.0;
+  return 4.0;
 };
 
