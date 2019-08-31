@@ -102,29 +102,23 @@
     contentRequest.contentLength = INT_MAX;
     // must be 'NO' to get player to start playing immediately
     contentRequest.byteRangeAccessSupported = NO;
-    //NSLog(@"avloader contentRequest %@", contentRequest);
+    //NSLog(@"resourceLoader contentRequest %@", contentRequest);
   }
 
   AVAssetResourceLoadingDataRequest* dataRequest = loadingRequest.dataRequest;
   if (dataRequest)
   {
-    // avplayer does a few probing requests.
-    bool probing = false;
-    if (dataRequest.requestedLength == 65536)
-    {
-      if (dataRequest.requestedOffset > 0)
-        probing = true;
-    }
-
-    //NSLog(@"probing %d, resourceLoader dataRequest %@", probing, dataRequest);
+    //NSLog(@"resourceLoader dataRequest %@", dataRequest);
 
     // overflow throttle, keep about 3-4 seconds buffered in avplayer
     _bufferedTime = mFrameDuration * ((float)mBufferedBytes / mFrameBytes);
     while (!mAbortflag && _bufferedTime - _currentTime > _minBufferedTime)
     {
-      usleep(32 * 1000);
+      usleep(5 * 1000);
+      //NSLog(@"resourceLoader bufferedTime %f, currentTime %f", _bufferedTime, _currentTime);
     }
 
+    size_t offset = dataRequest.requestedOffset;
     if (dataRequest.requestedLength == 2)
     {
       // avplayer always 1st reads two bytes to check for a content tag.
@@ -135,9 +129,19 @@
 #endif
       [loadingRequest finishLoading];
     }
+    else if (offset != mBufferedBytes)
+    {
+      // more probing, grr feed the pig junk
+      memset(mReadbuffer, 0x00, 65536);
+      NSData *data = [NSData dataWithBytes:mReadbuffer length:65536];
+      [dataRequest respondWithData:data];
+#if logDataRequest
+      NSLog(@"resourceLoader: probing 1, currentOffset %lu", (unsigned long)dataRequest.currentOffset);
+#endif
+      [loadingRequest finishLoading];
+    }
     else
     {
-      size_t offset = dataRequest.requestedOffset;
       size_t length = mReadbufferSize;
       if (dataRequest.requestedLength == 65536)
       {
@@ -149,7 +153,7 @@
       // Pull audio from buffer
       while (!mAbortflag && ![self checkFileBufferLength:offset length:length])
       {
-        usleep(32 * 1000);
+        usleep(5 * 1000);
       }
       lseek(mFileReader, offset, SEEK_SET);
       size_t availableBytes = read(mFileReader, mReadbuffer, length);
@@ -164,11 +168,10 @@
             NSData *data = [NSData dataWithBytes:mReadbuffer length:bytesToCopy];
             [dataRequest respondWithData:data];
 #if logDataRequest
-            NSLog(@"resourceLoader: probing %d, sending %lu bytes, ending offset %llu",
-              probing, (unsigned long)[data length], dataRequest.currentOffset);
+            NSLog(@"resourceLoader: probing 0, sending %lu bytes, ending offset %llu",
+              (unsigned long)[data length], dataRequest.currentOffset);
 #endif
-            if (!probing)
-              mBufferedBytes = dataRequest.currentOffset;
+            mBufferedBytes = dataRequest.currentOffset;
         }
         [loadingRequest finishLoading];
       }
@@ -189,6 +192,9 @@
 - (void)resourceLoader:(AVAssetResourceLoader *)resourceLoader
   didCancelLoadingRequest:(AVAssetResourceLoadingRequest *)loadingRequest
 {
+  #if logDataRequest
+    NSLog(@"resourceLoader: didCancelLoadingRequest");
+  #endif
   mAbortflag = true;
 }
 
@@ -272,18 +278,10 @@
   {
       if (_avplayer.currentItem.status == AVPlayerItemStatusReadyToPlay)
       {
-        if (abs([_avplayer rate]) > 0.0)
-          _loadedFlag = true;
-        else
-        {
-          // we can only preroll if not playing (rate == 0.0)
-          [_avplayer prerollAtRate:2.0 completionHandler:^(BOOL finished)
-          {
-            // set loaded regardless of finished or not.
-            _loadedFlag = true;
-          }];
-        }
-        //NSLog(@"avloader AVPlayerItemStatusReadyToPlay loaded %d", _loadedFlag);
+        _loadedFlag = true;
+#if logDataRequest
+        NSLog(@"resourceLoader: loaded true");
+#endif
       }
   }
   else
@@ -295,6 +293,7 @@
 //-----------------------------------------------------------------------------------
 - (int)addPackets:(uint8_t*)data size:(unsigned int)size
 {
+  //NSLog(@"resourceLoader: addPackets");
   CMTime cmSeconds = [_playerItem currentTime];
   _avLoader.currentTime = CMTimeGetSeconds(cmSeconds);
 
