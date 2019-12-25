@@ -99,6 +99,7 @@
     contentRequest.contentType = @"public.enhanced-ac3-audio";
     // (2147483647) or 383479.222678571428571 seconds at 0.032 secs per 1792 byte frame
     // or 10.652200629960317 hours.
+    // atmos is 2304 byte frames.
     contentRequest.contentLength = INT_MAX;
     // must be 'NO' to get player to start playing immediately
     contentRequest.byteRangeAccessSupported = NO;
@@ -121,7 +122,7 @@
     size_t offset = dataRequest.requestedOffset;
     if (dataRequest.requestedLength == 2)
     {
-      // avplayer always 1st reads two bytes to check for a content tag.
+      // AVAssetResourceLoader always 1st reads two bytes to check for a content tag.
       // ac3/eac3 has two byte tag of 0x0b77, \v is vertical tab == 0x0b
       [dataRequest respondWithData:[NSData dataWithBytes:"\vw" length:2]];
 #if logDataRequest
@@ -131,10 +132,9 @@
     }
     else if (offset != mBufferedBytes)
     {
-      // more probing, grr feed the pig junk
-      memset(mReadbuffer, 0x00, 65536);
-      NSData *data = [NSData dataWithBytes:mReadbuffer length:65536];
-      [dataRequest respondWithData:data];
+      // more probing, grr feed the pig the ac3/eac3 two byte tag again
+      // AVAssetResourceLoader needs to get something 'valid'.
+      [dataRequest respondWithData:[NSData dataWithBytes:"\vw" length:2]];
 #if logDataRequest
       NSLog(@"resourceLoader: probing 1, currentOffset %lu", (unsigned long)dataRequest.currentOffset);
 #endif
